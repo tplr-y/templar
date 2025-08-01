@@ -1,4 +1,6 @@
 import argparse
+import asyncio
+import boto3
 import gc
 import hashlib
 import os
@@ -7,6 +9,14 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+from neurons import miner
+from tqdm.auto import tqdm
+import io
+import cytoolz as c
+from joblib import Parallel, delayed
+
+from tplr import sharded_dataset, comms
 
 EXPECTED = {
     "tokens": {
@@ -32,16 +42,54 @@ def passthrough_print(x):
     return x
 
 
-def run_preprocessing(data_root: str, seq_len: int, token_dtype: np.dtype) -> bool:
+async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.Dtype = np.uint16): #data_root: str, seq_len: int, token_dtype: np.dtype) -> bool:
     """
     Consolidates .npy shards into single 'tokens.bin' and 'sample_ids.bin'.
     Also prints a SHA-256 digest and element count for sample_ids.bin.
     """
 
-    shards_dir = Path(data_root)
-    files = sorted(shards_dir.glob("train_*.npy"))
-    if not files:
-        raise FileNotFoundError(f"No train_*.npy shards found in {shards_dir}")
+    # shards_dir = Path(data_root)
+    # files = sorted(shards_dir.glob("train_*.npy"))
+    # if not files:
+    #     raise FileNotFoundError(f"No train_*.npy shards found in {shards_dir}")
+
+
+    config = miner.Miner.miner_config()
+    comms_ = comms.Comms(
+        config=config,
+        neuid=config.netuid,
+    )
+    bucket = comms_.get_own_bucket("dataset", "read")
+    tokens_file, ids_file = sharded_dataset.SharedShardedDataset.locate_shards(0)
+    await comms_.s3_get_object(
+        tokens_file,
+        bucket,
+        load_data=False,
+    )          
+
+    args.r2_endpoint_url = f"https://{args.r2_endpoint_url}.r2.cloudflarestorage.com"
+    # print("R2 mode enabled. Will upload to R2 bucket.")
+    session = boto3.session()
+    s3_client = session.client(
+        "s3",
+        endpoint_url=args.r2_endpoint_url,
+        aws_access_key_id=args.r2_access_key_id,
+        aws_secret_access_key=args.r2_secret_access_key,
+        region_name="auto",
+    )
+
+    # Check existing shards in R2
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=args.r2_bucket, Prefix=os.path.join(args.r2_prefix, "train_")
+        )
+        shards = len(response.get("Contents", []))
+        print(f"Shards found: {shards}")
+    except Exception as e:
+        print(f"Could not list objects in R2 bucket: {e}")
+        existing_count = 0
+
+    
 
     # ── 1. Size calculation ─────────────────────────────────────────────
     # print("Calculating total size of the dataset …")
@@ -57,17 +105,13 @@ def run_preprocessing(data_root: str, seq_len: int, token_dtype: np.dtype) -> bo
     #     tokens_file, dtype=token_dtype, mode="w+", shape=(total_tokens,)
     # )
 
-    import multiprocessing as mp
-    import os
 
-    import cytoolz as c
-    import cytoolz.curried as cc
-    from tqdm.auto import tqdm
 
-    p_map = c.curry(mp.Pool(os.cpu_count() - 1).imap, chunksize=128)
 
     # cursor = 0
-    for i, f_path in enumerate(files, start=1):
+    file_getter = asyncio.create_task(time.sleep(0))
+    for i in range(shards): #(files, start=1):
+        await file_getter
         #     shard = np.load(f_path)
         #     n = shard.shape[0]
         #     print(f"  • shard {i:>3}/{len(files)}  ({n:,} tokens)  → offset {cursor:,}")
@@ -83,10 +127,21 @@ def run_preprocessing(data_root: str, seq_len: int, token_dtype: np.dtype) -> bo
         # ── 3. Compute sample IDs ───────────────────────────────────────────
         # print(f"\n[2/2] Generating {ids_file} …")
         t1 = time.perf_counter()
+        
+        if i+1 < shards:
+            tokens_file, ids_file = sharded_dataset.SharedShardedDataset.locate_shards(i + 1)
+            file_getter = asyncio.create_task(comms_.s3_get_object(
+                tokens_file,
+                bucket,
+                load_data=False,
+            ))    
+
+        
+
 
         # Output paths
-        tokens_file = shards_dir / f"train_{i:06d}.npy"
-        ids_file = shards_dir / f"sample_ids_{i:06d}.bin"
+        # tokens_file = shards_dir / f"train_{i:06d}.npy"
+        # ids_file = shards_dir / f"sample_ids_{i:06d}.bin"
 
         import pdb
         # pdb.set_trace()
@@ -127,7 +182,6 @@ def run_preprocessing(data_root: str, seq_len: int, token_dtype: np.dtype) -> bo
         #     cc.map(lambda x: x.tofile(ids_file)),
         #     list,
         # )
-        from joblib import Parallel, delayed
 
         bits = Parallel(n_jobs=os.cpu_count() * 2, prefer="threads")(
             delayed(tokens_handler)(np.stack(arr))
@@ -136,6 +190,18 @@ def run_preprocessing(data_root: str, seq_len: int, token_dtype: np.dtype) -> bo
             )
         )
         sample_ids = np.stack(bits).view(np.uint64)
+
+        buffer = io.BytesIO()
+        np.save(buffer, sample_ids)
+        buffer.seek(0)
+
+        key = os.path.join(args.r2_prefix, ids_file)
+        s3_client.upload_fileobj(buffer, args.r2_bucket, key)
+        tqdm.write(
+            f"Uploaded sample_ids {i} to R2: s3://{args.r2_bucket}/{key} "
+        )
+
+
         sample_ids.tofile(ids_file)
 
         # for i in range(total_samples):
@@ -228,6 +294,33 @@ def main():
         help="Data type used in the shards",
     )
 
+    # R2 arguments
+    parser.add_argument(
+        "--r2_bucket",
+        default=os.getenv("R2_DATASET_BUCKET_NAME"),
+        help="R2 bucket name",
+    )
+    parser.add_argument(
+        "--r2_prefix",
+        default="remote/tokenized/",
+        help="R2 prefix for shards",
+    )
+    parser.add_argument(
+        "--r2_endpoint_url",
+        default=os.getenv("R2_DATASET_ACCOUNT_ID"),
+        help="R2 endpoint URL",
+    )
+    parser.add_argument(
+        "--r2_access_key_id",
+        default=os.getenv("R2_DATASET_WRITE_ACCESS_KEY_ID"),
+        help="R2 access key ID",
+    )
+    parser.add_argument(
+        "--r2_secret_access_key",
+        default=os.getenv("R2_DATASET_WRITE_SECRET_ACCESS_KEY"),
+        help="R2 secret access key",
+    )
+
     args = parser.parse_args()
 
     # Convert string dtype to numpy dtype
@@ -246,11 +339,11 @@ def main():
     print(f"  • Token dtype: {args.token_dtype}")
     print()
 
-    success = run_preprocessing(args.data_root, args.seq_len, token_dtype)
+    success = run_preprocessing(args)#args.data_root, args.seq_len, token_dtype)
 
     if not success:
         exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

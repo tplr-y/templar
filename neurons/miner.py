@@ -231,6 +231,7 @@ class Miner(BaseNode):
                 gradient_as_bucket_view=True,
             )
             tplr.logger.info("[Init] wrapped model with DistributedDataParallel")
+        self.bare_model = getattr(self.model, "module", self.model)
         self.tokenizer = self.hparams.tokenizer
 
         # Init compression
@@ -247,14 +248,6 @@ class Miner(BaseNode):
         # Init optimizer and momentum
         self.error_feedback = {}
         self.owned_params = set()
-
-        self.xshapes = {}
-        self.totalks = {}
-        model_iterator = (
-            self.model.module.named_parameters()
-            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
-            else self.model.named_parameters()
-        )
 
         self.outer_optimizer = SGD(
             self.model.parameters(), lr=self.hparams.outer_learning_rate
@@ -294,6 +287,10 @@ class Miner(BaseNode):
             milestones=[inner_steps_before_outer_step, self.hparams.warmup_steps],
         )
         tplr.logger.info("[Init] optimizers & schedulers constructed")
+
+        self.xshapes = {}
+        self.totalks = {}
+        model_iterator = self.bare_model.named_parameters()
 
         for idx, (n, p) in enumerate(model_iterator):
             if idx % self.world_size == self.rank:
@@ -344,6 +341,7 @@ class Miner(BaseNode):
         self.global_step = 0  # Initialize global_step to zero
         self.comms.current_window = self.current_window
         self.step_counter = 0
+        # self.windows_per_shard = 500
 
         # Add step tracking
         self.window_step = 0
@@ -375,11 +373,17 @@ class Miner(BaseNode):
         # Initialize peer related attributes
         self.next_peers: list[int] | None = None
         self.peers_update_window = -1
-        self.dataset = tplr.SharedShardedDataset(
+        
+        self.dataset_manager = tplr.sharded_dataset.ShardedDatasetManager(
             sequence_length=self.hparams.sequence_length,
             rank=self.rank,
             world_size=self.world_size,
+            comms=self.comms,
         )
+        # can you call this here or does it need to be in the upper section of run?
+        _ = await self.dataset_manager.initialize_datasets(0)     
+        self.dataset = self.dataset_manager.active_dataset
+       
         self.sampler = tplr.MinerSampler(
             dataset=self.dataset,
             uid=self.uid,
@@ -391,12 +395,14 @@ class Miner(BaseNode):
             rank=self.rank,
             world_size=self.world_size,
         )
+        
         self.loader = torch.utils.data.DataLoader(
             dataset=self.dataset,
             sampler=self.sampler,
             batch_size=self.hparams.micro_batch_size,
-            num_workers=2,
+            num_workers=10,
             pin_memory=True,
+            prefetch_factor=2,
         )
 
         tplr.logger.info("[Init] dataset + sampler ready")
@@ -454,18 +460,12 @@ class Miner(BaseNode):
         #   • remaining ranks receive state via NCCL broadcast
         # ------------------------------------------------------------------
 
-        bare_model = (
-            self.model.module
-            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
-            else self.model
-        )
-
         if self.world_size == 1 or self.is_master:
             (
                 ckpt_ok,
                 ckpt_sync_win,
             ) = await self.comms.load_checkpoint(
-                model=bare_model,
+                model=self.bare_model,
                 current_window=self.current_window,
                 device=str(self.device),
                 init_version=tplr.__version__
@@ -498,7 +498,7 @@ class Miner(BaseNode):
             bcast_start = tplr.T()
 
             # 1) parameters & buffers
-            for tensor in bare_model.state_dict().values():
+            for tensor in self.bare_model.state_dict().values():
                 if torch.is_tensor(tensor):
                     dist.broadcast(tensor.data, src=0)
 
@@ -533,13 +533,24 @@ class Miner(BaseNode):
 
             # 2. Load data
             data_start = tplr.T()
+            
+            windows_per_shard = getattr(self.hparams, "windows_per_shard", 100)
             # Update sampler for current window
-            self.sampler.set_window_uid(self.uid, step_window)
+            self.sampler.set_window_uid(self.uid, step_window % windows_per_shard)
+            
+            if (
+                step_window > 0 
+                and 
+                step_window % windows_per_shard == 0
+            ):
+                tplr.logger.info(f"Swapping dataset at wondow {step_window}")
+                await self.dataset_manager.swap_datasets()
 
             data_loading_time = tplr.T() - data_start
             tplr.logger.info(
                 f"{tplr.P(step_window, data_loading_time)} Loaded training data"
             )
+            
             # 3. Accumulate gradients over batches
             train_start = tplr.T()
             tplr.logger.info("Start accumulating...")
@@ -738,11 +749,7 @@ class Miner(BaseNode):
                 debug_dict = {}
 
                 # Add model parameters debug info
-                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
-                    model_iterator = self.model.module.named_parameters()
-                else:
-                    model_iterator = self.model.named_parameters()
-                for name, param in model_iterator:
+                for name, param in self.bare_model.named_parameters():
                     if (
                         param is not None and param.numel() >= 2
                     ):  # Check if tensor has at least 2 elements
@@ -1059,13 +1066,8 @@ class Miner(BaseNode):
         # ------------------------------------------------------------------ #
         # 6. parameter offloading logic
         # ------------------------------------------------------------------ #
-        bare_model = (
-            self.model.module
-            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
-            else self.model
-        )
         with torch.no_grad():
-            for saved_param, p in zip(params_offloaded, bare_model.parameters()):
+            for saved_param, p in zip(params_offloaded, self.bare_model.parameters()):
                 saved_param = saved_param.to(p.device, non_blocking=True)
 
                 # (a) pseudo-gradient for outer step
@@ -1087,13 +1089,9 @@ class Miner(BaseNode):
 
     def _get_offloaded_param(self):
         """Get a copy of current parameters and offload them to CPU"""
-        bare_model = (
-            self.model
-            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
-            else self.model
-        )
         return [
-            param.data.detach().clone().to("cpu") for param in bare_model.parameters()
+            param.data.detach().clone().to("cpu")
+            for param in self.bare_model.parameters()
         ]
 
     async def cleanup_window(self):
