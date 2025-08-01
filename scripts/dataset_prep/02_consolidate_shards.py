@@ -16,7 +16,7 @@ import io
 import cytoolz as c
 from joblib import Parallel, delayed
 
-from tplr import sharded_dataset, comms
+from tplr import sharded_dataset, comms, hparams
 
 EXPECTED = {
     "tokens": {
@@ -55,10 +55,11 @@ async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.dtype = n
 
 
     config = miner.Miner.miner_config()
-    comms_ = comms.Comms(
+    comms_ = comms.Comms(  
         wallet=None,
         config=config,
         neuid=config.netuid,
+        hparams=hparams.load_hparams(), # use_local_run_hparams=self.config.local)
     )
     bucket = comms_.get_own_bucket("dataset", "read")
     tokens_file, ids_file = sharded_dataset.SharedShardedDataset.locate_shards(0)
