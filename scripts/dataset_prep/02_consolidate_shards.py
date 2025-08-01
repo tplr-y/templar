@@ -65,10 +65,12 @@ async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.dtype = n
     tokens_file, ids_file = sharded_dataset.SharedShardedDataset.locate_shards(0)
     print("Downloading first shard")
     try:
-        downloaded = await comms_.s3_get_object(
-            tokens_file,
-            bucket,
-            load_data=False,
+        downloaded = await asyncio.create_task(
+            comms_.s3_get_object(
+                tokens_file,
+                bucket,
+                load_data=False,
+            )
         )
         print(downloaded, type(downloaded))
         print("Shard downloaded")
