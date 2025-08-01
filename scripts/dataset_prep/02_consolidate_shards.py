@@ -327,11 +327,11 @@ def main():
     token_dtype = getattr(np, args.token_dtype)
 
     # Validate inputs
-    if not Path(args.data_root).exists():
-        raise FileNotFoundError(f"Shards directory does not exist: {args.data_root}")
+    # if not Path(args.data_root).exists():
+    #     raise FileNotFoundError(f"Shards directory does not exist: {args.data_root}")
 
-    if args.seq_len <= 0:
-        raise ValueError("Sequence length must be positive")
+    # if args.seq_len <= 0:
+    #     raise ValueError("Sequence length must be positive")
 
     print("Configuration:")
     print(f"  • Shards path: {args.data_root}")
