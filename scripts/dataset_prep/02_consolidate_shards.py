@@ -71,7 +71,7 @@ async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.dtype = n
 
     args.r2_endpoint_url = f"https://{args.r2_endpoint_url}.r2.cloudflarestorage.com"
     # print("R2 mode enabled. Will upload to R2 bucket.")
-    session = boto3.session()
+    session = boto3.session.Session()
     s3_client = session.client(
         "s3",
         endpoint_url=args.r2_endpoint_url,
