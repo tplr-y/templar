@@ -56,6 +56,7 @@ async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.dtype = n
 
     config = miner.Miner.miner_config()
     comms_ = comms.Comms(
+        wallet=None,
         config=config,
         neuid=config.netuid,
     )
