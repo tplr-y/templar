@@ -381,7 +381,7 @@ class Miner(BaseNode):
             comms=self.comms,
         )
         # can you call this here or does it need to be in the upper section of run?
-        _ = await self.dataset_manager.initialize_datasets(0)     
+        # _ = await self.dataset_manager.initialize_datasets(0)     
         self.dataset = self.dataset_manager.active_dataset
        
         self.sampler = tplr.MinerSampler(
