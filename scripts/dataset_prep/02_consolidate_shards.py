@@ -111,7 +111,7 @@ async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.dtype = n
 
 
     # cursor = 0
-    file_getter = asyncio.create_task(time.sleep(0))
+    file_getter = asyncio.create_task(asyncio.sleep(0))
     for i in range(shards): #(files, start=1):
         await file_getter
         #     shard = np.load(f_path)
