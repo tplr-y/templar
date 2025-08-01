@@ -42,7 +42,7 @@ def passthrough_print(x):
     return x
 
 
-async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.Dtype = np.uint16): #data_root: str, seq_len: int, token_dtype: np.dtype) -> bool:
+async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.dtype = np.uint16): #data_root: str, seq_len: int, token_dtype: np.dtype) -> bool:
     """
     Consolidates .npy shards into single 'tokens.bin' and 'sample_ids.bin'.
     Also prints a SHA-256 digest and element count for sample_ids.bin.
