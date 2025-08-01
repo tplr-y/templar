@@ -266,7 +266,7 @@ async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.dtype = n
     return all_ok
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(
         description="Consolidate .npy shards into tokens.bin and sample_ids.bin",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -339,7 +339,7 @@ def main():
     print(f"  • Token dtype: {args.token_dtype}")
     print()
 
-    success = run_preprocessing(args)#args.data_root, args.seq_len, token_dtype)
+    success = await run_preprocessing(args)#args.data_root, args.seq_len, token_dtype)
 
     if not success:
         exit(1)
