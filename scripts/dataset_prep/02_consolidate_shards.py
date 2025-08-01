@@ -139,9 +139,9 @@ async def run_preprocessing(args, seq_len: int = 2048, token_dtype: np.dtype = n
         t1 = time.perf_counter()
         
         if i+1 < shards:
-            tokens_file, ids_file = sharded_dataset.SharedShardedDataset.locate_shards(i + 1)
+            new_tokens_file, new_ids_file = sharded_dataset.SharedShardedDataset.locate_shards(i + 1)
             file_getter = asyncio.create_task(comms_.s3_get_object(
-                tokens_file,
+                new_tokens_file,
                 bucket,
                 load_data=False,
             ))    
