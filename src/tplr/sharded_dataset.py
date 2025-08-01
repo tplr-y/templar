@@ -15,6 +15,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -56,22 +57,17 @@ class SharedShardedDataset(Dataset):
         self.world = world_size
         if self.world > 1:
             dist.barrier(device_ids=[self.rank])
-            
+
         self.tokens_file, self.ids_file = self.locate_shards(shard_index)
-        if not self.tokens_file.exists() or not self.ids_file.exists():
-            raise FileNotFoundError(
-                f"Pre-processed files not found in {'/'.join(self.tokens_file.split('/')[:-1])}. "
-                "Run the preprocessing script first."
-            )
-            
+        _ = self.check_paths([self.tokens_file, self.ids_file])
         _ = self.mmap_tokens_and_ids(token_dtype)
-        
+
         # should wrap in a timer
         tplr.logger.info(
             f"[Dataset] rank {self.rank}: init done in {time.perf_counter() - t0:.1f}s "
             f"({self.total_samples} samples)"
         )
-    
+
     @staticmethod
     def locate_shards(
         shard_index: int,
@@ -90,14 +86,28 @@ class SharedShardedDataset(Dataset):
         Raises:
             ValueError: If the dataset path is not configured.
         """
-        shards_path = os.getenv("DATASET_BINS_PATH") or custom_path
+        shards_path = custom_path or os.getenv("DATASET_BINS_PATH")
         if shards_path is None:
-            raise ValueError("Dataset path not configured. Set $DATASET_BINS_PATH or provide custom_path")
+            raise ValueError(
+                "Dataset path not configured. Set $DATASET_BINS_PATH or provide custom_path"
+            )
 
-        tokens_file = os.path.join(shards_path, f'shard_{shard_index:06d}.npy')
-        ids_file = tokens_file.replace('.npy', '.ids')
+        tokens_file = os.path.join(shards_path, f"train_{shard_index:06d}.npy")
+        ids_file = os.path.join(shards_path, f"sample_ids_{shard_index:06d}.bin")
 
         return tokens_file, ids_file
+
+    @staticmethod
+    def check_paths(paths: list[os.PathLike]) -> None:
+        for path in paths:
+            if not os.path.exists(path):
+                *dir_path, file = path.split("/")
+                dir_path = "/".join(dir_path)
+                raise FileNotFoundError(
+                    f"Pre-processed file {file} not found in {dir_path}. "
+                    "Run the preprocessing script first."
+                )
+        return
 
     def mmap_tokens_and_ids(self, token_dtype: npt.DTypeLike):
         """Memory-maps the tokens and sample IDs from their respective files.
@@ -171,43 +181,68 @@ class ShardedDatasetManager:
         self.shard_index = 0
 
         self.active_dataset: SharedShardedDataset | None = None
-        self.upcoming_dataset: SharedShardedDataset | None = None
+        self.upcoming_dataset: asyncio.Task | None = None
 
         self.comms = comms
 
         # should comms glob to know all file paths?
-        # self.max_dataset_idx = bucket_glob_files_idx
+        self.max_dataset_idx = 10  # bucket_glob_files_idx
 
-    async def prepare_shard(self, shard_index: int):
+    def prepare_shard(self, shard_index: int) -> asyncio.Task:
         """Prepares a shard for use, downloading it if necessary.
 
         Args:
             shard_index: The index of the shard to prepare.
 
         Returns:
-            An asyncio Task that completes when the download is finished, or True if no download was needed.
+            An asyncio Task that completes when the download is finished
         """
-        download_completed = True
         tokens_file, ids_file = SharedShardedDataset.locate_shards(shard_index)
         tplr.logger.info(f"Preparing shard {shard_index} at {tokens_file}")
 
-        if not os.path.exists(tokens_file):
-            bucket = self.comms.get_own_bucket("shared_dataset", "read")
-            download_completed = asyncio.create_task(
+        if os.path.exists(tokens_file) and os.path.exists(ids_file):
+            # if exist, return completed task
+            print(f"Shard {shard_index} already exists on disk. Loading...")
+            task = asyncio.create_task(asyncio.sleep(0))
+
+        else:
+            bucket = self.comms.get_own_bucket("dataset", "read")
+            task = asyncio.create_task(
+                self.download_files(bucket, tokens_file, ids_file)
+            )
+
+        return task
+
+    async def download_files(
+        self,
+        bucket: tplr.schemas.Bucket,
+        tokens_file: os.PathLike,
+        ids_file: os.PathLike,
+    ) -> asyncio.TaskGroup:
+        """
+        Downloads the shard and its indices
+
+        Args:
+            bucket: The (shared shard) r2 storage bucket
+            tokens_file: The path to the tokens file in bucket
+            ids_file: The path to the tokens file's indices in bucket
+        """
+        return await asyncio.gather(
+            asyncio.create_task(
                 self.comms.s3_get_object(
                     tokens_file,
                     bucket,
-                    load_file=False,
-                ),
-            )
-            _ = asyncio.create_task(
+                    load_data=False,
+                )
+            ),
+            asyncio.create_task(
                 self.comms.s3_get_object(
                     ids_file,
                     bucket,
-                    load_file=False,
-                ),
-            )
-        return download_completed
+                    load_data=False,
+                )
+            ),
+        )
 
     async def create_dataset(self, shard_index: int) -> SharedShardedDataset:
         """Creates a `SharedShardedDataset` instance for a given shard index.
@@ -218,7 +253,9 @@ class ShardedDatasetManager:
         Returns:
             An instance of `SharedShardedDataset`.
         """
-        downloaded = await self.prepare_shard(shard_index)
+        download_task = self.prepare_shard(shard_index)
+        await download_task
+
         dataset = SharedShardedDataset(
             shard_index=shard_index,
             sequence_length=self.sequence_length,
@@ -228,7 +265,7 @@ class ShardedDatasetManager:
         )
         return dataset
 
-    async def initialize_datasets(self, current_shard_index: int):
+    async def initialize_datasets(self, current_shard_index: int) -> None:
         """Initializes the active and upcoming datasets.
 
         This method creates the dataset for the current shard index and starts
@@ -238,10 +275,11 @@ class ShardedDatasetManager:
             current_shard_index: The index of the shard to make active.
         """
         self.active_dataset = await self.create_dataset(current_shard_index)
-        self.upcoming_dataset = asyncio.create_task(self.prepare_shard(current_shard_index + 1))
+        next_shard = (current_shard_index + 1) % self.max_dataset_idx
+        self.upcoming_dataset = self.prepare_shard(next_shard)
         return
 
-    async def swap_datasets(self):
+    async def swap_datasets(self) -> int:
         """Swaps the active dataset with the upcoming one.
 
         This method waits for the upcoming dataset to be ready, makes it the
@@ -249,23 +287,24 @@ class ShardedDatasetManager:
         the files of the old dataset.
         """
         self.shard_index += 1
+        self.shard_index = self.shard_index % self.max_dataset_idx  # allow replay
 
         if self.upcoming_dataset:
             await self.upcoming_dataset
 
-        if self.upcoming_dataset is None:
-            # end of training shards, restart?
-            # more like pass incremented shards and see
-            # if > max_dataset_idx
-            pass
-
-        old_dataset = getattr(self, "active_dataset")
-        _ = self.initialize_datasets(self.shard_index)
+        old_dataset = self.active_dataset
+        await self.initialize_datasets(self.shard_index)
         tplr.logger.info("successfully swapped datasets.")
 
-        if old_dataset:
-            os.remove(old_dataset.tokens_file)
-            os.remove(old_dataset.ids_file)
-            del old_dataset
+        if old_dataset and self.rank == 0:
+            filenames = ["tokens_file", "ids_file"]
+            files_to_delete = [old_dataset.tokens_file, old_dataset.ids_file]
+            for name, filepath in zip(filenames, files_to_delete):
+                try:
+                    os.remove(filepath)
+                except FileNotFoundError:
+                    tplr.logger.error(f"{name} file not available for deletion")
 
-        return
+        del old_dataset
+
+        return self.shard_index
