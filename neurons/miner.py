@@ -56,6 +56,13 @@ import tplr
 # Local
 from neurons import BaseNode
 
+# Local > experimental Muon optimizer
+# Pytorch integration WIP, see:
+# Issue opened by Keller James: https://github.com/pytorch/pytorch/issues/148819
+# Single device (we need this one): https://github.com/pytorch/pytorch/pull/159465
+# TODO: replace this with Pytorch implementation once above PR merges
+#from muon import SingleDeviceMuonWithAuxAdam
+
 # Import the DCT functions from the transformer module
 from tplr.model_factory import initialize_torchtitan_model
 
@@ -132,6 +139,44 @@ class Miner(BaseNode):
             type=str,
             default="./log/profiler",
             help="Directory to save profiler traces",
+        )
+        parser.add_argument(
+            "--inner-optimizer",
+            type=str,
+            default="adamw",
+            choices=["adamw", "muon"],
+            help="Inner optimizer to use, from {adamw, muon} (default: adamw)",
+        )
+        # Muon-specific hyperparameters
+        parser.add_argument(
+            "--muon-momentum",
+            type=float,
+            default=0.95,
+            help="Momentum for Muon optimizer (default: 0.95)",
+        )
+        parser.add_argument(
+            "--muon-weight-decay",
+            type=float,
+            default=0.01,
+            help="Weight decay for Muon optimizer (default: 0.01)",
+        )
+        parser.add_argument(
+            "--muon-head-lr-scale",
+            type=float,
+            default=0.5,
+            help="Learning rate scale for head parameters with Muon (default: 0.5)",
+        )
+        parser.add_argument(
+            "--muon-embed-lr-scale",
+            type=float,
+            default=0.5,
+            help="Learning rate scale for embedding parameters with Muon (default: 0.5)",
+        )
+        parser.add_argument(
+            "--muon-scalar-lr-scale",
+            type=float,
+            default=0.2,
+            help="Learning rate scale for scalar parameters with Muon (default: 0.2)",
         )
         bt.subtensor.add_args(parser)
         bt.logging.add_args(parser)
@@ -283,15 +328,86 @@ class Miner(BaseNode):
         self.outer_optimizer = SGD(
             self.model.parameters(), lr=self.hparams.outer_learning_rate
         )
-        self.inner_optimizer = ZeroRedundancyOptimizer(
-            self.model.parameters(),
-            optimizer_class=torch.optim.AdamW,
-            lr=self.hparams.inner_learning_rate,
-            weight_decay=self.hparams.weight_decay,
-            betas=(0.9, 0.95),
-            parameters_as_bucket_view=True,
-            overlap_with_ddp=False,
+        # Initialize inner optimizer based on config
+        if self.config.inner_optimizer.lower() == "adamw":
+            self.inner_optimizer = ZeroRedundancyOptimizer(
+                self.model.parameters(),
+                optimizer_class=torch.optim.AdamW,
+                lr=self.hparams.inner_learning_rate,
+                weight_decay=self.hparams.weight_decay,
+                betas=(0.9, 0.95),
+                parameters_as_bucket_view=True,
+                overlap_with_ddp=False,
         )
+        elif self.config.inner_optimizer.lower() == "muon":
+            # Separate parameters for Muon (2D matrices) and Adam (embeddings, scalars, head)
+            hidden_2d_params = []
+            embed_params = []
+            scalar_params = []
+            head_params = []
+            
+            for name, param in self.bare_model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                                
+                if param.ndim >= 2 and "embed" not in name and "lm_head" not in name:
+                    hidden_2d_params.append(param)
+                elif "embed" in name:
+                    embed_params.append(param)
+                elif "lm_head" in name:
+                    head_params.append(param)
+                else:
+                    scalar_params.append(param)
+            
+            # Create parameter groups
+            adam_groups = []
+            if head_params:
+                adam_groups.append(dict(
+                    params=head_params,
+                    lr=self.hparams.inner_learning_rate * self.config.muon_head_lr_scale,
+                    weight_decay=self.hparams.weight_decay
+                ))
+            if embed_params:
+                adam_groups.append(dict(
+                    params=embed_params,
+                    lr=self.hparams.inner_learning_rate * self.config.muon_embed_lr_scale,
+                    weight_decay=self.hparams.weight_decay
+                ))
+            if scalar_params:
+                adam_groups.append(dict(
+                    params=scalar_params,
+                    lr=self.hparams.inner_learning_rate * self.config.muon_scalar_lr_scale,
+                    weight_decay=self.hparams.weight_decay
+                ))
+            
+            adam_groups = [dict(**g, betas=(0.9, 0.95), eps=1e-8, use_muon=False) for g in adam_groups]
+            
+            if not hidden_2d_params:
+                tplr.logger.error("No hidden 2D parameters found for Muon optimizer")
+                raise ValueError("Model must have 2D weight matrices for Muon")
+            
+            muon_group = dict(
+                params=hidden_2d_params,
+                lr=self.hparams.inner_learning_rate,
+                momentum=self.config.muon_momentum,
+                weight_decay=self.config.muon_weight_decay,
+                use_muon=True
+            )
+            
+            param_groups = adam_groups + [muon_group]
+            # Don't need collective communication for inner optimizer
+            self.inner_optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+            
+            tplr.logger.info(
+                f"[Init] Using Muon inner optimizer with lr={self.hparams.inner_learning_rate}, "
+                f"momentum={self.config.muon_momentum}, weight_decay={self.config.muon_weight_decay}"
+            )
+            tplr.logger.info(f"  - Hidden matrix params: {len(hidden_2d_params)} (Muon)")
+            tplr.logger.info(f"  - Embedding params: {len(embed_params)} (Adam)")
+            tplr.logger.info(f"  - Scalar params: {len(scalar_params)} (Adam)")
+            tplr.logger.info(f"  - Head params: {len(head_params)} (Adam)")
+        else:
+            raise ValueError(f"Unknown inner optimizer: {self.config.inner_optimizer}")
         inner_steps_before_outer_step = self.hparams.inner_steps * (
             self.hparams.validator_offset + self.hparams.peer_list_window_margin + 1
         )

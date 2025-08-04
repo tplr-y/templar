@@ -60,7 +60,7 @@ def main(args):
     print(f"Output: {shard_path}")
 
     dataset = load_dataset(
-        args.dataset, split="train", streaming=True, trust_remote_code=True
+        args.dataset, split="train", streaming=True, trust_remote_code=False
     ).shuffle(seed=args.seed, buffer_size=args.buffer_size)
 
     num_proc = args.num_proc if args.num_proc > 0 else max(1, os.cpu_count() * 3 // 4)
