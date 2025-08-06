@@ -66,8 +66,8 @@ class ImportMonitor:
             if len(self.buffer) > self.buffer_size:
                 self.buffer.pop(0)
                 
-            # Only print every 1000th line to terminal as progress
-            if self.line_count % 1000 == 0:
+            # Only print every 1000000th line to terminal as progress
+            if self.line_count % 1000000 == 0:
                 print(f"... traced {self.line_count} lines ...")
                 
         elif event == 'exception':
