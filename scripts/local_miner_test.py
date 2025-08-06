@@ -27,6 +27,59 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+
+import faulthandler
+import os
+import sys
+
+# Enable faulthandler to write to a file instead of stderr
+debug_file = open('miner_crash_debug.log', 'w')
+faulthandler.enable(file=debug_file)
+
+# Set environment variables for debugging (these will log to files/internally)
+os.environ["TORCH_CPP_LOG_LEVEL"] = "INFO"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "1"
+os.environ["NCCL_DEBUG"] = "INFO"
+os.environ["NCCL_DEBUG_FILE"] = "nccl_debug.log"  # NCCL logs to file
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+# Create a custom import hook that only logs around the failure point
+class ImportMonitor:
+    def __init__(self):
+        self.active = False
+        self.log_file = open('import_trace.log', 'w')
+        self.line_count = 0
+        self.buffer = []
+        self.buffer_size = 100  # Keep last 100 lines
+        
+    def trace_calls(self, frame, event, arg):
+        if not self.active:
+            return
+            
+        if event == 'line':
+            self.line_count += 1
+            line_info = f"{self.line_count}: {frame.f_code.co_filename}:{frame.f_lineno} in {frame.f_code.co_name}\n"
+            
+            # Keep a rolling buffer
+            self.buffer.append(line_info)
+            if len(self.buffer) > self.buffer_size:
+                self.buffer.pop(0)
+                
+            # Only print every 1000th line to terminal as progress
+            if self.line_count % 1000 == 0:
+                print(f"... traced {self.line_count} lines ...")
+                
+        elif event == 'exception':
+            # If we hit an exception, dump the buffer
+            self.log_file.write("=== EXCEPTION DETECTED - LAST 100 LINES ===\n")
+            for line in self.buffer:
+                self.log_file.write(line)
+            self.log_file.write(f"EXCEPTION: {arg}\n")
+            self.log_file.flush()
+            
+        return self.trace_calls
+
 # Root-rank printing helper
 _ORIG_PRINT = builtins.print
 
@@ -240,12 +293,44 @@ sys.argv = [
     _hparams_file.name,
 ]
 
-print("Initialising Miner (Llama-3 8B / TorchTitan)…")
-from neurons.miner import Miner
 
-miner = Miner()
-miner.model.eval()
-print("Miner initialised.")
+monitor = ImportMonitor()
+
+# Print minimal debug info to terminal
+print(f"Debug logs being written to:")
+print(f"  - miner_crash_debug.log (faulthandler)")
+print(f"  - import_trace.log (import trace)")
+print(f"  - nccl_debug.log (NCCL)")
+print(f"Starting import...")
+
+# Enable tracing only for the Miner import
+print("Initialising Miner (Llama-3 8B / TorchTitan)…")
+monitor.active = True
+sys.settrace(monitor.trace_calls)
+
+try:
+    from neurons.miner import Miner
+    print("Import successful!")
+    miner = Miner()
+    print("Init successful!")
+    miner.model.eval()
+    print("eval mode successful!")
+    monitor.active = False
+    sys.settrace(None)
+except:
+    monitor.active = False
+    sys.settrace(None)
+    # Write the last lines before crash
+    monitor.log_file.write("\n=== FINAL BUFFER BEFORE CRASH ===\n")
+    for line in monitor.buffer:
+        monitor.log_file.write(line)
+    monitor.log_file.close()
+    raise
+# print("Initialising Miner (Llama-3 8B / TorchTitan)…")
+
+# miner = Miner()
+# miner.model.eval()
+# print("Miner initialised.")
 
 
 # Dataset loader for .bin token shards
